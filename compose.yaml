@@ -5,8 +5,8 @@ services:
       dockerfile: Dockerfile
     volumes:
       - .:/app
-      #- ./hugg:/app/hugg
-      #- ./bert:/app/bert
+      - ./hugg:/app/hugg
+      - ./bert:/app/bert
     env_file: .env
     ports:
       - "8000:8000"
