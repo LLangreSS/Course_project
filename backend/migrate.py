@@ -23,7 +23,7 @@ async def migrate_data():
             for item in metadata:
                 text_to_embed = f"{item['entity_name']}: {item['content']['natural_language']}"
 
-                embedding = ml_engine.search_model.encode([text_to_embed])[0]
+                embedding = ml_engine.search_model.encode([text_to_embed], normalize_embeddings=True)[0]
 
                 entry = KnowledgeBase(
                     id=item['id'],
