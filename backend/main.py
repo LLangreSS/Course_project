@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.endpoints import router as verify_router
+from api.verify import router as verify_router
 from core.ml_engine import ml_engine
 
 

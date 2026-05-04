@@ -36,94 +36,106 @@ async def verify_text(request: VerifyRequest, db: DB):
     atomic_claims = split_into_atomic_claims(request.text)
     all_results = []
     has_contradiction = False
+
     for claim in atomic_claims:
         query_vec_list = await run_in_threadpool(
             ml_engine.search_model.encode, [claim], normalize_embeddings=True
         )
         query_vec = query_vec_list[0]
-        stmt = select(KnowledgeBase).order_by(
-            KnowledgeBase.embedding.max_inner_product(query_vec)
+
+        sim_expr = (1 - KnowledgeBase.embedding.cosine_distance(query_vec)).label('similarity')
+        stmt = select(KnowledgeBase, sim_expr).order_by(
+            KnowledgeBase.embedding.cosine_distance(query_vec)
         ).limit(3)
 
         db_result = await db.execute(stmt)
-        matches = db_result.scalars().all()
+        matches_with_scores = db_result.all()
 
-        if not matches:
-            all_results.append(FactResult(fact=claim, verdict="No data", max_sim=0.0))
+        if not matches_with_scores:
+            all_results.append(FactResult(fact=claim, verdict="Нет данных", max_sim=0.0))
             continue
 
-        contexts_text = []
-        for match in matches:
-            natural_lang = match.content.get("natural_language", '')
-            contexts_text.append(f"{match.entity_id} — это {natural_lang}")
+        max_sim = matches_with_scores[0].similarity
 
-        probs_batch = await run_in_threadpool(run_nli_model, contexts_text, [claim] * len(matches))
-        best_match_detail = None
-        highest_confirm = -1.0
-        fact_verdict = "Нет данных"
+        if max_sim < request.threshold:
+            all_results.append(FactResult(fact=claim, verdict="Нет данных", max_sim=max_sim))
+            continue
+
+        valid_candidates = []
+        contexts_text = []
+        for match, sim_score in matches_with_scores:
+            if sim_score >= (request.threshold - 0.05):
+                natural_lang = match.content.get("natural_language", '')
+                clean_context = f"{match.entity_id} — это {natural_lang}"
+
+                contexts_text.append(clean_context)
+                valid_candidates.append((match, sim_score, clean_context))
+
+        if not contexts_text:
+            all_results.append(FactResult(fact=claim, verdict="Нет данных", max_sim=max_sim))
+            continue
+
+        probs_batch = await run_in_threadpool(run_nli_model, contexts_text, [claim] * len(contexts_text))
+
+        current_fact_matches = []
         claim_lower = claim.lower()
 
         for i, probs in enumerate(probs_batch):
-            match = matches[i]
+            match, sim_score, clean_ctx = valid_candidates[i]
             term_lower = match.entity_id.lower()
+
             subject_found = term_lower in claim_lower or any(w in claim_lower for w in term_lower.split() if len(w) > 3)
 
             n_val, e_val, c_val = 0.0, 0.0, 0.0
-
             for j, prob in enumerate(probs):
                 label = ml_engine.id2label[j].lower()
                 if 'entail' in label:
+                    # Блокировка подмены субъекта
                     e_val = prob if subject_found else 0.0
                 elif 'contradict' in label:
+                    # Искусственный риск при несовпадении субъекта
                     c_val = prob if subject_found else 0.95
                 else:
                     n_val = prob
 
+            # ПЕССИМИСТИЧНЫЙ ФИЛЬТР (Neutral + Contradict > Entail)
             if (n_val + c_val) > e_val:
                 e_val = 0.0
 
-            scores = {"Подтверждено": e_val, "Нейтрально": n_val, "Противоречие": c_val}
+            res_scores = {"Подтверждено": e_val, "Нейтрально": n_val, "Противоречие": c_val}
 
-            if e_val > highest_confirm:
-                highest_confirm = e_val
-                best_match_detail = MatchDetail(
-                    term=match.entity_id,
-                    context=contexts_text[i],
-                    similarity=1.0,
-                    scores=scores,
-                    subject_match=subject_found
-                )
+            current_fact_matches.append(MatchDetail(
+                term=match.entity_id,
+                context=clean_ctx,
+                similarity=sim_score,
+                scores=res_scores,
+                subject_match=subject_found
+            ))
 
-        if best_match_detail:
-            fact_verdict = max(best_match_detail.scores, key=best_match_detail.scores.get)
-            if best_match_detail.scores['Подтверждено'] == 0.0:
-                temp = best_match_detail.scores.copy()
-                del temp['Подтверждено']
-                fact_verdict = max(temp, key=temp.get)
+        current_fact_matches.sort(key=lambda x: x.scores.get('Подтверждено', 0), reverse=True)
 
-            if fact_verdict == "Противоречие":
-                has_contradiction = True
+        best_match = current_fact_matches[0]
+        fact_verdict = max(best_match.scores, key=best_match.scores.get)
 
-            # 7. Записываем историю в БД для аналитики (асинхронно)
-            #history_entry = VerificationHistory(
-             #   claim=claim,
-              #  verdict=fact_verdict,
-               # confidence=best_match_detail.scores[fact_verdict],
-                #matched_knowledge_id=matches[0].id  # Сохраняем связь с базой
-            #)
-            #db.add(history_entry)
+        if best_match.scores['Подтверждено'] == 0.0:
+            temp = best_match.scores.copy()
+            del temp['Подтверждено']
+            fact_verdict = max(temp, key=temp.get)
+
+        if fact_verdict == "Противоречие":
+            has_contradiction = True
 
         all_results.append(
             FactResult(
                 fact=claim,
                 verdict=fact_verdict,
-                max_sim=1.0,
-                best_match=best_match_detail
+                max_sim=max_sim,
+                best_match=best_match,
+                all_matches=current_fact_matches
             )
         )
 
     missing_count = sum(1 for r in all_results if r.verdict == "Нет данных")
-
     if missing_count == len(all_results):
         final_status = "NO_DATA"
     elif missing_count > 0:
