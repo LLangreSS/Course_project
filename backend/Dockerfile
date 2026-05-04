@@ -5,6 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
 ENV POETRY_VERSION=2.3.2
+ENV POETRY_REQUESTS_TIMEOUT=10000
 ENV POETRY_HOME="/opt/poetry"
 ENV POETRY_VIRTUALENVS_IN_PROJECT=true
 ENV POETRY_NO_INTERACTION=1
@@ -20,7 +21,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl \
 RUN --mount=type=cache,target=/root/.cache/pypoetry \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
     --mount=type=bind,source=poetry.lock,target=poetry.lock \
-    poetry install --no-root --only main
+    poetry config installer.max-workers 2 && \
+    poetry install --no-root --only main -vvv
 
 FROM python:${PYTHON_VERSION}-slim as final
 
