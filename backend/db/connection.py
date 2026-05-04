@@ -1,3 +1,6 @@
+from typing import Annotated
+
+from fastapi import Depends
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession, AsyncAttrs
 from sqlalchemy.orm import DeclarativeBase
 
@@ -19,3 +22,6 @@ async def get_session() -> AsyncSession:
             await session.rollback()
             print(f"Database error: {e}")
             raise e
+
+
+DB = Annotated[AsyncSession, Depends(get_session)]
