@@ -6,8 +6,9 @@ from sqlalchemy import select
 
 from db.connection import DB
 from db.models import KnowledgeBase
-from schemas import AddFactRequest
+from schemas import AddFactRequest, DeleteFactRequest
 from core.ml_engine import ml_engine
+from fastapi import status
 
 router = APIRouter(prefix='/knowledge_base', tags=['Knnowledge Base'])
 
@@ -52,3 +53,20 @@ async def add_fact(request: AddFactRequest, db: DB):
         "status": "success",
         "message": f"Термин '{request.entity_id}' успешно добавлен.",
     }
+
+
+@router.delete('/', status_code=204)
+async def delete_fact(request: DeleteFactRequest, db: DB):
+    query = select(KnowledgeBase).where(KnowledgeBase.entity_id == request.entity_id)
+    result = await db.execute(query)
+    result = result.scalars().first()
+    if not result:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Факт {request.entity_id} не найден."
+        )
+
+    await db.delete(result)
+    await db.commit()
+
+    return None

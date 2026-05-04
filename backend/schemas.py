@@ -12,6 +12,7 @@ class MatchDetail(BaseModel):
     context: str
     similarity: float
     scores: Dict[str, float]
+    verdict: str
     subject_match: bool
 
 
@@ -43,6 +44,10 @@ class AddFactRequest(BaseModel):
     parent_id: Optional[str] = ""
     depends_on: List[str] = []
     conflicts_with: List[str] = []
+
+
+class DeleteFactRequest(BaseModel):
+    entity_id: str
 
 
 

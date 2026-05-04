@@ -20,3 +20,4 @@ class KnowledgeBase(Base):
     relations: Mapped[Dict[str, Any]] = mapped_column(JSONB)
 
     embedding: Mapped[Any] = mapped_column(Vector(384))
+    search_text_bm25: Mapped[str] = mapped_column(String)

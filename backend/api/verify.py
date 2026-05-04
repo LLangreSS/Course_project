@@ -3,7 +3,7 @@ import torch
 
 from fastapi import APIRouter
 from fastapi.concurrency import run_in_threadpool
-from sqlalchemy import select
+from sqlalchemy import select, func
 
 from core.ml_engine import ml_engine
 from db.models import KnowledgeBase
@@ -31,9 +31,18 @@ def run_nli_model(contexts: list[str], claims: list[str]):
         return torch.softmax(outputs.logits, dim=1).tolist()
 
 
+def reciprocal_rank_fusion(vector_ids: list, fts_ids: list, k: int = 60):
+    scores = {}
+    for rank, doc_id in enumerate(vector_ids):
+        scores[doc_id] = scores.get(doc_id, 0) + 1.0 / (k + rank + 1)
+    for rank, doc_id in enumerate(fts_ids):
+        scores[doc_id] = scores.get(doc_id, 0) + 1.0 / (k + rank + 1)
+    return sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
+
 @router.post('/', response_model=VerifyResponse)
 async def verify_text(request: VerifyRequest, db: DB):
     atomic_claims = split_into_atomic_claims(request.text)
+
     all_results = []
     has_contradiction = False
 
@@ -44,93 +53,75 @@ async def verify_text(request: VerifyRequest, db: DB):
         query_vec = query_vec_list[0]
 
         sim_expr = (1 - KnowledgeBase.embedding.cosine_distance(query_vec)).label('similarity')
-        stmt = select(KnowledgeBase, sim_expr).order_by(
-            KnowledgeBase.embedding.cosine_distance(query_vec)
-        ).limit(3)
+        vec_stmt = select(KnowledgeBase.id, sim_expr).order_by(sim_expr.desc()).limit(10)
+        vec_res = await db.execute(vec_stmt)
+        vec_rows = vec_res.all()
 
-        db_result = await db.execute(stmt)
-        matches_with_scores = db_result.all()
+        vector_candidates = [row.id for row in vec_rows if row.similarity >= (request.threshold - 0.15)]
 
-        if not matches_with_scores:
+        fts_stmt = select(KnowledgeBase.id).where(
+            func.to_tsvector('russian', KnowledgeBase.search_text_bm25).op('@@')(func.plainto_tsquery('russian', claim))
+        ).limit(10)
+        fts_res = await db.execute(fts_stmt)
+        fts_candidates = [row_id for row_id in fts_res.scalars().all()]
+
+        fused_indices = reciprocal_rank_fusion(vector_candidates, fts_candidates)
+
+        if not fused_indices:
             all_results.append(FactResult(fact=claim, verdict="Нет данных", max_sim=0.0))
             continue
 
-        max_sim = matches_with_scores[0].similarity
+        stmt = select(KnowledgeBase).where(KnowledgeBase.id.in_(fused_indices))
+        db_docs = await db.execute(stmt)
+        id_to_doc = {doc.id: doc for doc in db_docs.scalars().all()}
 
-        if max_sim < request.threshold:
-            all_results.append(FactResult(fact=claim, verdict="Нет данных", max_sim=max_sim))
-            continue
+        candidate_docs = [id_to_doc[did] for did in fused_indices if did in id_to_doc]
+        pairs = [[claim, doc.search_text_bm25] for doc in candidate_docs]
 
-        valid_candidates = []
-        contexts_text = []
-        for match, sim_score in matches_with_scores:
-            if sim_score >= (request.threshold - 0.05):
-                natural_lang = match.content.get("natural_language", '')
-                clean_context = f"{match.entity_id} — это {natural_lang}"
+        rerank_scores = await run_in_threadpool(ml_engine.rerank_model.predict, pairs)
 
-                contexts_text.append(clean_context)
-                valid_candidates.append((match, sim_score, clean_context))
+        reranked = sorted(zip(candidate_docs, rerank_scores), key=lambda x: x[1], reverse=True)
+        best_results = reranked[:3]
 
-        if not contexts_text:
-            all_results.append(FactResult(fact=claim, verdict="Нет данных", max_sim=max_sim))
-            continue
-
-        probs_batch = await run_in_threadpool(run_nli_model, contexts_text, [claim] * len(contexts_text))
+        final_contexts = [res[0].search_text_bm25 for res in best_results]
+        probs_batch = await run_in_threadpool(run_nli_model, final_contexts, [claim] * len(final_contexts))
 
         current_fact_matches = []
-        claim_lower = claim.lower()
-
         for i, probs in enumerate(probs_batch):
-            match, sim_score, clean_ctx = valid_candidates[i]
-            term_lower = match.entity_id.lower()
+            doc, rerank_score = best_results[i]
 
-            subject_found = term_lower in claim_lower or any(w in claim_lower for w in term_lower.split() if len(w) > 3)
+            scores_dict = {
+                ('Подтверждено' if 'entail' in ml_engine.id2label[j].lower() else
+                 'Противоречие' if 'contradict' in ml_engine.id2label[j].lower() else
+                 'Нейтрально'): p for j, p in enumerate(probs)
+            }
 
-            n_val, e_val, c_val = 0.0, 0.0, 0.0
-            for j, prob in enumerate(probs):
-                label = ml_engine.id2label[j].lower()
-                if 'entail' in label:
-                    # Блокировка подмены субъекта
-                    e_val = prob if subject_found else 0.0
-                elif 'contradict' in label:
-                    # Искусственный риск при несовпадении субъекта
-                    c_val = prob if subject_found else 0.95
-                else:
-                    n_val = prob
+            best_label = max(scores_dict, key=scores_dict.get)
 
-            # ПЕССИМИСТИЧНЫЙ ФИЛЬТР (Neutral + Contradict > Entail)
-            if (n_val + c_val) > e_val:
-                e_val = 0.0
-
-            res_scores = {"Подтверждено": e_val, "Нейтрально": n_val, "Противоречие": c_val}
+            fact_verdict = "Недостаточно контекста" if (
+                        best_label == 'Нейтрально' and scores_dict['Нейтрально'] > 0.6) else best_label
 
             current_fact_matches.append(MatchDetail(
-                term=match.entity_id,
-                context=clean_ctx,
-                similarity=sim_score,
-                scores=res_scores,
-                subject_match=subject_found
+                term=doc.entity_id,
+                context=doc.content.get("natural_language", ""),
+                similarity=float(rerank_score),
+                scores=scores_dict,
+                verdict=fact_verdict,
+                subject_match=True
             ))
 
-        current_fact_matches.sort(key=lambda x: x.scores.get('Подтверждено', 0), reverse=True)
+        top_match = current_fact_matches[0]
+        final_verdict = top_match.verdict
 
-        best_match = current_fact_matches[0]
-        fact_verdict = max(best_match.scores, key=best_match.scores.get)
-
-        if best_match.scores['Подтверждено'] == 0.0:
-            temp = best_match.scores.copy()
-            del temp['Подтверждено']
-            fact_verdict = max(temp, key=temp.get)
-
-        if fact_verdict == "Противоречие":
+        if final_verdict == "Противоречие":
             has_contradiction = True
 
         all_results.append(
             FactResult(
                 fact=claim,
-                verdict=fact_verdict,
-                max_sim=max_sim,
-                best_match=best_match,
+                verdict=final_verdict,
+                max_sim=top_match.similarity,
+                best_match=top_match,
                 all_matches=current_fact_matches
             )
         )
