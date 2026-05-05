@@ -15,7 +15,6 @@ class Base(DeclarativeBase):
 class KnowledgeBase(Base):
     __tablename__ = 'knowledge_base'
 
-    # Первичный ключ (обязательно должен быть String/Text для BM25 key_field)
     id: Mapped[str] = mapped_column(String(50), primary_key=True)
 
     entity_id: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -26,6 +25,8 @@ class KnowledgeBase(Base):
 
     embedding: Mapped[Any] = mapped_column(Vector(384))
     search_text_bm25: Mapped[str] = mapped_column(String)
+
+    rich_context: Mapped[str] = mapped_column(String)
 
 
 Index(

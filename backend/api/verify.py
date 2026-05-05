@@ -85,14 +85,15 @@ async def verify_text(request: VerifyRequest, db: DB):
         id_to_doc = {doc.id: doc for doc in db_docs.scalars().all()}
 
         ordered_candidates = [id_to_doc[did] for did in candidate_ids if did in id_to_doc]
-        pairs = [[claim, doc.search_text_bm25] for doc in ordered_candidates]
+        pairs = [[claim, doc.rich_context] for doc in ordered_candidates]
 
         rerank_scores = await run_in_threadpool(ml_engine.rerank_model.predict, pairs)
         reranked = sorted(zip(ordered_candidates, rerank_scores), key=lambda x: x[1], reverse=True)
 
         best_results = reranked[:3]
-
-        final_contexts = [res[0].search_text_bm25 for res in best_results]
+        print(best_results[0])
+        final_contexts = [res[0].rich_context for res in best_results]
+        print(final_contexts)
         probs_batch = await run_in_threadpool(run_nli_model, final_contexts, [claim] * len(final_contexts))
 
         current_fact_matches = []
@@ -131,12 +132,14 @@ async def verify_text(request: VerifyRequest, db: DB):
         ))
 
     missing_count = sum(1 for r in all_results if r.verdict == "Нет данных")
-    if missing_count == len(all_results):
+    if has_contradiction:
+        final_status = "CONTRADICTION"
+    elif missing_count == len(all_results):
         final_status = "NO_DATA"
-    elif missing_count > 0:
-        final_status = "PARTIAL_SUCCESS"
-    else:
+    elif all(r.verdict == "Подтверждено" for r in all_results):
         final_status = "SUCCESS"
+    else:
+        final_status = "PARTIAL_SUCCESS"
 
     return VerifyResponse(
         status=final_status,
