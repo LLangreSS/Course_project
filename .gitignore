@@ -1,6 +1,7 @@
 # Created by https://www.toptal.com/developers/gitignore/api/pycharm,macos
 # Edit at https://www.toptal.com/developers/gitignore?templates=pycharm,macos
 .env
+.venv
 ### macOS ###
 # General
 .DS_Store
@@ -10,6 +11,10 @@
 # Icon must end with two \r
 Icon
 
+bert
+hugg
+rerank
+postgres_data
 
 # Thumbnails
 ._*

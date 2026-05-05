@@ -7,6 +7,7 @@ class VerifyRequest(BaseModel):
     text: str
     threshold: float = 0.85
 
+
 class MatchDetail(BaseModel):
     term: str
     context: str

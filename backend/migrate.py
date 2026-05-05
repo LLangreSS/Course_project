@@ -12,12 +12,6 @@ def tokenize_ru(txt: str):
 
 async def migrate_data():
     print("Настройка базы данных и расширения pgvector...")
-    async with engine.begin() as conn:
-        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-        await conn.run_sync(Base.metadata.create_all)
-        await conn.execute(text("CREATE INDEX idx_kb_search_text ON knowledge_base "
-                                "USING gin(to_tsvector('russian', search_text_bm25))"))
-
     ml_engine.load_models()
 
     with open("propositional_kb (1).json", "r", encoding="utf-8") as f:
@@ -29,8 +23,8 @@ async def migrate_data():
             x = 0
             for item in metadata:
                 print(x)
+                x += 1
                 print(item)
-                x+=1
                 embed_parts = [f"Термин: {item['entity_name']}. Определение {item['entity_name']}: "
                                f"{item['content']['natural_language']}"]
 
