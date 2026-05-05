@@ -24,8 +24,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(verify_router)
-app.include_router(knowledge_base_router)
+app.include_router(verify_router, prefix="/verify", tags=["Verification"])
+app.include_router(knowledge_base_router, prefix="/knowledge_base", tags=["Knowledge Base"])
 
 if __name__ == "__main__":
     import uvicorn

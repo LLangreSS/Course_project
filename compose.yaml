@@ -17,9 +17,13 @@ services:
     image: ankane/pgvector:latest
     container_name: knowledge_db
     restart: always
-    env_file: .env
+    # Replace env_file with explicit environment variables
+    environment:
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=knowledge_guard
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -30,4 +34,3 @@ services:
 
 volumes:
   pgdata:
-

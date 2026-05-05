@@ -4,7 +4,7 @@ from fastapi import Depends
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession, AsyncAttrs
 from sqlalchemy.orm import DeclarativeBase
 
-db_url = "postgresql+asyncpg://admin:password@localhost:5432/knowledge_guard"
+db_url = "postgresql+asyncpg://admin:password@localhost:5433/knowledge_guard"
 engine = create_async_engine(db_url, echo=True)
 async_session = async_sessionmaker(bind=engine, expire_on_commit=False)
 
