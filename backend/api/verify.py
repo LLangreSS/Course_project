@@ -33,24 +33,38 @@ def run_nli_model(contexts: list[str], claims: list[str]):
         return torch.softmax(outputs.logits, dim=1).tolist()
 
 
-def reciprocal_rank_fusion(vector_ids: list, fts_ids: list, k: int = 60):
+def get_normalized_rrf_scores(vector_ids: list, fts_ids: list, k: int = 60):
+    """
+    Считает RRF и нормализует баллы в диапазон [0, 1].
+    Это необходимо для корректного смешивания со скорами реранкера.
+    """
     scores = {}
     for rank, doc_id in enumerate(vector_ids):
         scores[doc_id] = scores.get(doc_id, 0) + 1.0 / (k + rank + 1)
     for rank, doc_id in enumerate(fts_ids):
         scores[doc_id] = scores.get(doc_id, 0) + 1.0 / (k + rank + 1)
-    return sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
+
+    if not scores:
+        return {}
+
+    # Нормализация (Min-Max)
+    max_s = max(scores.values())
+    min_s = min(scores.values())
+
+    if max_s == min_s:
+        return {idx: 1.0 for idx in scores}
+
+    return {idx: (s - min_s) / (max_s - min_s) for idx, s in scores.items()}
 
 
 @router.post('/', response_model=VerifyResponse)
 async def verify_text(request: VerifyRequest, db: DB):
     atomic_claims = split_into_atomic_claims(request.text)
-    print(atomic_claims)
     all_results = []
     has_contradiction = False
 
     for claim in atomic_claims:
-        print(claim)
+        # 1. Поиск кандидатов (Векторный)
         query_vec_list = await run_in_threadpool(
             ml_engine.search_model.encode, [f"query: {claim}"], normalize_embeddings=True
         )
@@ -60,10 +74,9 @@ async def verify_text(request: VerifyRequest, db: DB):
         vec_stmt = select(KnowledgeBase.id, sim_expr).order_by(sim_expr.desc()).limit(10)
         vec_res = await db.execute(vec_stmt)
         vec_rows = vec_res.all()
-
-        # Фильтр по порогу как у напарника
         vector_candidates = [row.id for row in vec_rows if row.similarity >= (request.threshold - 0.15)]
 
+        # 2. Поиск кандидатов (Полнотекстовый BM25)
         fts_stmt = (
             select(KnowledgeBase.id)
             .where(search.match_any(KnowledgeBase.search_text_bm25, claim))
@@ -73,53 +86,70 @@ async def verify_text(request: VerifyRequest, db: DB):
         fts_res = await db.execute(fts_stmt)
         fts_candidates = fts_res.scalars().all()
 
-        fused_indices = reciprocal_rank_fusion(vector_candidates, list(fts_candidates))
+        # 3. Слияние и получение нормализованных весов RRF
+        rrf_scores_map = get_normalized_rrf_scores(vector_candidates, list(fts_candidates))
+        fused_indices = sorted(rrf_scores_map.keys(), key=lambda x: rrf_scores_map[x], reverse=True)
 
         if not fused_indices:
             all_results.append(FactResult(fact=claim, verdict="Нет данных", max_sim=0.0))
             continue
 
+        # 4. Загрузка документов
         candidate_ids = fused_indices[:10]
         stmt = select(KnowledgeBase).where(KnowledgeBase.id.in_(candidate_ids))
         db_docs = await db.execute(stmt)
         id_to_doc = {doc.id: doc for doc in db_docs.scalars().all()}
 
+        # Сохраняем порядок, который был после RRF
         ordered_candidates = [id_to_doc[did] for did in candidate_ids if did in id_to_doc]
-        pairs = [[claim, doc.rich_context] for doc in ordered_candidates]
 
+        # 5. Реранкинг (Cross-Encoder)
+        pairs = [[claim, doc.rich_context] for doc in ordered_candidates]
         rerank_scores = await run_in_threadpool(ml_engine.rerank_model.predict, pairs)
-        reranked = sorted(zip(ordered_candidates, rerank_scores), key=lambda x: x[1], reverse=True)
+
+        # 6. Гибридное взвешивание (Hybrid Scoring)
+        # FinalScore = (Reranker * 0.7) + (RRF * 0.3)
+        hybrid_results = []
+        for doc, r_score in zip(ordered_candidates, rerank_scores):
+            rrf_weight = rrf_scores_map.get(doc.id, 0)
+            final_h_score = (r_score * 0.7) + (rrf_weight * 0.3)
+            hybrid_results.append((doc, final_h_score))
+
+        # Сортируем по итоговому гибридному баллу
+        reranked = sorted(hybrid_results, key=lambda x: x[1], reverse=True)
+
+        # Логгирование для отладки
+        print(f"\n[ CLAIM: {claim} ]")
+        for res, h_score in reranked:
+            print(f"Hybrid: {h_score:.4f} | Entity: {res.entity_id}")
 
         best_results = reranked[:3]
-        print(best_results[0])
+        best_doc, best_hybrid_score = best_results[0]
+
+        # 7. NLI Проверка (на основе лучшего контекста)
         final_contexts = [res[0].rich_context for res in best_results]
-        print(final_contexts)
         probs_batch = await run_in_threadpool(run_nli_model, final_contexts, [claim] * len(final_contexts))
+        best_probs = probs_batch[0]
 
-        current_fact_matches = []
-        for i, probs in enumerate(probs_batch):
-            doc, rerank_score = best_results[i]
+        scores_dict = {
+            ('Подтверждено' if 'entail' in ml_engine.id2label[j].lower() else
+             'Противоречие' if 'contradict' in ml_engine.id2label[j].lower() else
+             'Нейтрально'): p for j, p in enumerate(best_probs)
+        }
 
-            scores_dict = {
-                ('Подтверждено' if 'entail' in ml_engine.id2label[j].lower() else
-                 'Противоречие' if 'contradict' in ml_engine.id2label[j].lower() else
-                 'Нейтрально'): p for j, p in enumerate(probs)
-            }
+        best_label = max(scores_dict, key=scores_dict.get)
+        fact_verdict = "Недостаточно контекста" if (
+                best_label == 'Нейтрально' and scores_dict['Нейтрально'] > 0.6) else best_label
 
-            best_label = max(scores_dict, key=scores_dict.get)
-            fact_verdict = "Недостаточно контекста" if (
-                    best_label == 'Нейтрально' and scores_dict['Нейтрально'] > 0.6) else best_label
+        top_match = MatchDetail(
+            term=best_doc.entity_id,
+            context=best_doc.content.get("natural_language", ""),
+            similarity=float(best_hybrid_score),
+            scores=scores_dict,
+            verdict=fact_verdict,
+            subject_match=True
+        )
 
-            current_fact_matches.append(MatchDetail(
-                term=doc.entity_id,
-                context=doc.content.get("natural_language", ""),
-                similarity=float(rerank_score),
-                scores=scores_dict,
-                verdict=fact_verdict,
-                subject_match=True
-            ))
-
-        top_match = current_fact_matches[0]
         if top_match.verdict == "Противоречие":
             has_contradiction = True
 
@@ -128,9 +158,10 @@ async def verify_text(request: VerifyRequest, db: DB):
             verdict=top_match.verdict,
             max_sim=top_match.similarity,
             best_match=top_match,
-            all_matches=current_fact_matches
+            all_matches=[top_match]
         ))
 
+    # Формирование итогового статуса
     missing_count = sum(1 for r in all_results if r.verdict == "Нет данных")
     if has_contradiction:
         final_status = "CONTRADICTION"

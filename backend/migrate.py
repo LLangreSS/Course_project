@@ -38,7 +38,6 @@ async def migrate_data():
                                 f"Определение: {item['content']['natural_language']} ")
                 if item['content']['formal_logic']: rich_context += f"Формально: {item['content']['formal_logic']}. "
                 if item['content']['explanation']: rich_context += f"Пояснение: {item['content']['explanation']}. "
-                if item['content']['examples']: rich_context += f"Примеры: {'; '.join(item['content']['examples'])}. "
                 if item['relations']['conflicts_with']: rich_context += f"Логические анти-факты: {'; '.join(item['relations']['conflicts_with'])}."
 
                 entry = KnowledgeBase(
