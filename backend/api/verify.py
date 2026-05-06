@@ -3,7 +3,8 @@ import torch
 
 from fastapi import APIRouter
 from fastapi.concurrency import run_in_threadpool
-from sqlalchemy import select
+from sqlalchemy import select, desc
+from paradedb.sqlalchemy import search, pdb
 
 from core.ml_engine import ml_engine
 from db.models import KnowledgeBase
@@ -13,11 +14,12 @@ from db.connection import DB
 router = APIRouter(prefix='/verify', tags=['Verification'])
 
 
-def split_into_atomic_claims(complex_claim):
-    complex_claim = complex_claim.strip().rstrip('.')
-    split_pattern = r'(?:,\s*где\s+)|(?:,\s*а\s+)|(?:,\s*но\s+)|(?:,\s*котор[а-я]{2}\s+)|(?:,\s*и\s+)'
-    parts = re.split(split_pattern, complex_claim)
-    return [p.strip() for p in parts if len(p.strip().split()) >= 3] or [complex_claim]
+def split_into_atomic_claims(txt: str):
+    """Разделяет сложный текст на атомарные утверждения по союзам."""
+    txt = txt.strip().rstrip('.')
+    split_pattern = r'(?:,?\s*\bа\b\s+)|(?:,?\s*\bно\b\s+)|(?:,?\s*\bи\b\s+)|(?:,?\s*\bгде\b\s+)'
+    parts = re.split(split_pattern, txt)
+    return [p.strip() for p in parts if len(p.strip().split()) >= 3] or [txt]
 
 
 def run_nli_model(contexts: list[str], claims: list[str]):
@@ -31,6 +33,29 @@ def run_nli_model(contexts: list[str], claims: list[str]):
         return torch.softmax(outputs.logits, dim=1).tolist()
 
 
+def get_normalized_rrf_scores(vector_ids: list, fts_ids: list, k: int = 60):
+    """
+    Считает RRF и нормализует баллы в диапазон [0, 1].
+    Это необходимо для корректного смешивания со скорами реранкера.
+    """
+    scores = {}
+    for rank, doc_id in enumerate(vector_ids):
+        scores[doc_id] = scores.get(doc_id, 0) + 1.0 / (k + rank + 1)
+    for rank, doc_id in enumerate(fts_ids):
+        scores[doc_id] = scores.get(doc_id, 0) + 1.0 / (k + rank + 1)
+
+    if not scores:
+        return {}
+
+    max_s = max(scores.values())
+    min_s = min(scores.values())
+
+    if max_s == min_s:
+        return {idx: 1.0 for idx in scores}
+
+    return {idx: (s - min_s) / (max_s - min_s) for idx, s in scores.items()}
+
+
 @router.post('/', response_model=VerifyResponse)
 async def verify_text(request: VerifyRequest, db: DB):
     atomic_claims = split_into_atomic_claims(request.text)
@@ -39,112 +64,108 @@ async def verify_text(request: VerifyRequest, db: DB):
 
     for claim in atomic_claims:
         query_vec_list = await run_in_threadpool(
-            ml_engine.search_model.encode, [claim], normalize_embeddings=True
+            ml_engine.search_model.encode, [f"query: {claim}"], normalize_embeddings=True
         )
-        query_vec = query_vec_list[0]
+        query_vec = query_vec_list[0].tolist()
 
         sim_expr = (1 - KnowledgeBase.embedding.cosine_distance(query_vec)).label('similarity')
-        stmt = select(KnowledgeBase, sim_expr).order_by(
-            KnowledgeBase.embedding.cosine_distance(query_vec)
-        ).limit(3)
+        vec_stmt = select(KnowledgeBase.id, sim_expr).order_by(sim_expr.desc()).limit(10)
+        vec_res = await db.execute(vec_stmt)
+        vec_rows = vec_res.all()
+        vector_candidates = [row.id for row in vec_rows if row.similarity >= (request.threshold - 0.15)]
 
-        db_result = await db.execute(stmt)
-        matches_with_scores = db_result.all()
+        fts_stmt = (
+            select(KnowledgeBase.id)
+            .where(search.match_any(KnowledgeBase.search_text_bm25, claim))
+            .order_by(desc(pdb.score(KnowledgeBase.id)))
+            .limit(10)
+        )
+        fts_res = await db.execute(fts_stmt)
+        fts_candidates = fts_res.scalars().all()
 
-        if not matches_with_scores:
+        rrf_scores_map = get_normalized_rrf_scores(vector_candidates, list(fts_candidates))
+        fused_indices = sorted(rrf_scores_map.keys(), key=lambda x: rrf_scores_map[x], reverse=True)
+
+        if not fused_indices:
             all_results.append(FactResult(fact=claim, verdict="Нет данных", max_sim=0.0))
             continue
 
-        max_sim = matches_with_scores[0].similarity
+        candidate_ids = fused_indices[:10]
+        stmt = select(KnowledgeBase).where(KnowledgeBase.id.in_(candidate_ids))
+        db_docs = await db.execute(stmt)
+        id_to_doc = {doc.id: doc for doc in db_docs.scalars().all()}
 
-        if max_sim < request.threshold:
-            all_results.append(FactResult(fact=claim, verdict="Нет данных", max_sim=max_sim))
-            continue
+        ordered_candidates = [id_to_doc[did] for did in candidate_ids if did in id_to_doc]
 
-        valid_candidates = []
-        contexts_text = []
-        for match, sim_score in matches_with_scores:
-            if sim_score >= (request.threshold - 0.05):
-                natural_lang = match.content.get("natural_language", '')
-                clean_context = f"{match.entity_id} — это {natural_lang}"
+        pairs = [[claim, doc.rich_context] for doc in ordered_candidates]
+        rerank_scores = await run_in_threadpool(ml_engine.rerank_model.predict, pairs)
 
-                contexts_text.append(clean_context)
-                valid_candidates.append((match, sim_score, clean_context))
+        hybrid_results = []
+        for doc, r_score in zip(ordered_candidates, rerank_scores):
+            rrf_weight = rrf_scores_map.get(doc.id, 0)
+            final_h_score = (r_score * 0.7) + (rrf_weight * 0.3)
+            hybrid_results.append((doc, final_h_score))
 
-        if not contexts_text:
-            all_results.append(FactResult(fact=claim, verdict="Нет данных", max_sim=max_sim))
-            continue
+        reranked = sorted(hybrid_results, key=lambda x: x[1], reverse=True)
 
-        probs_batch = await run_in_threadpool(run_nli_model, contexts_text, [claim] * len(contexts_text))
+        best_results = reranked[:3]
+        best_doc, best_hybrid_score = best_results[0]
 
-        current_fact_matches = []
-        claim_lower = claim.lower()
+        final_contexts = [res[0].rich_context for res in best_results]
+        probs_batch = await run_in_threadpool(run_nli_model, final_contexts, [claim] * len(final_contexts))
+        best_probs = probs_batch[0]
+        best_doc, best_hybrid_score = best_results[0]
 
-        for i, probs in enumerate(probs_batch):
-            match, sim_score, clean_ctx = valid_candidates[i]
-            term_lower = match.entity_id.lower()
+        p_entail = 0.0
+        p_contra = 0.0
+        p_neutral = 0.0
 
-            subject_found = term_lower in claim_lower or any(w in claim_lower for w in term_lower.split() if len(w) > 3)
+        for j, p in enumerate(best_probs):
+            label = ml_engine.id2label[j].lower()
+            if 'entail' in label:
+                p_entail = p
+            elif 'contradict' in label:
+                p_contra = p
+            else:
+                p_neutral = p
 
-            n_val, e_val, c_val = 0.0, 0.0, 0.0
-            for j, prob in enumerate(probs):
-                label = ml_engine.id2label[j].lower()
-                if 'entail' in label:
-                    # Блокировка подмены субъекта
-                    e_val = prob if subject_found else 0.0
-                elif 'contradict' in label:
-                    # Искусственный риск при несовпадении субъекта
-                    c_val = prob if subject_found else 0.95
-                else:
-                    n_val = prob
+        scores_dict = {
+            'Подтверждено': p_entail,
+            'Противоречие': p_contra,
+            'Нейтрально': p_neutral
+        }
 
-            # ПЕССИМИСТИЧНЫЙ ФИЛЬТР (Neutral + Contradict > Entail)
-            if (n_val + c_val) > e_val:
-                e_val = 0.0
+        if p_neutral >= 0.65:
+            fact_verdict = "Недостаточно контекста"
+        elif (p_neutral + p_contra) > p_entail:
+            fact_verdict = "Противоречие"
+        else:
+            fact_verdict = "Подтверждено"
 
-            res_scores = {"Подтверждено": e_val, "Нейтрально": n_val, "Противоречие": c_val}
-
-            current_fact_matches.append(MatchDetail(
-                term=match.entity_id,
-                context=clean_ctx,
-                similarity=sim_score,
-                scores=res_scores,
-                subject_match=subject_found
-            ))
-
-        current_fact_matches.sort(key=lambda x: x.scores.get('Подтверждено', 0), reverse=True)
-
-        best_match = current_fact_matches[0]
-        fact_verdict = max(best_match.scores, key=best_match.scores.get)
-
-        if best_match.scores['Подтверждено'] == 0.0:
-            temp = best_match.scores.copy()
-            del temp['Подтверждено']
-            fact_verdict = max(temp, key=temp.get)
-
-        if fact_verdict == "Противоречие":
-            has_contradiction = True
-
-        all_results.append(
-            FactResult(
-                fact=claim,
-                verdict=fact_verdict,
-                max_sim=max_sim,
-                best_match=best_match,
-                all_matches=current_fact_matches
-            )
+        top_match = MatchDetail(
+            term=best_doc.entity_id,
+            context=best_doc.content.get("natural_language", ""),
+            similarity=float(best_hybrid_score),
+            scores=scores_dict
         )
 
-    missing_count = sum(1 for r in all_results if r.verdict == "Нет данных")
-    if missing_count == len(all_results):
+        all_results.append(FactResult(
+            fact=claim,
+            verdict=fact_verdict,
+            best_match=top_match
+        ))
+
+    has_any_contradiction = any(r.verdict == "Противоречие" for r in all_results)
+    has_any_no_data = any(r.verdict in ("Недостаточно контекста", "Нет данных") for r in all_results)
+
+    if has_any_contradiction:
+        final_status = "CONTRADICTION"
+    elif has_any_no_data:
         final_status = "NO_DATA"
-    elif missing_count > 0:
-        final_status = "PARTIAL_SUCCESS"
     else:
         final_status = "SUCCESS"
 
     return VerifyResponse(
         status=final_status,
-        has_contradiction=has_contradiction,
         results=all_results
     )
