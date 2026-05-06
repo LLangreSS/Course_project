@@ -1,4 +1,4 @@
-from typing import Optional, List, Dict, Literal
+from typing import Optional, List, Dict, Literal, Any
 
 from pydantic import BaseModel
 
@@ -44,6 +44,14 @@ class AddFactRequest(BaseModel):
 
 class DeleteFactRequest(BaseModel):
     entity_id: str
+
+
+class KnowledgeFactResponse(BaseModel):
+    entity_id: str
+    domain: Optional[str]
+    fact_type: Optional[str]
+    content: Dict[str, Any]
+    relations: Optional[Dict[str, Any]]
 
 
 
